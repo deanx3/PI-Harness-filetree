@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { parseColor } from "@earendil-works/pi-tui";
-import { act, bashFiles, folderColor, newState, render, view, type State } from "../extensions/filetree.ts";
+import { act, bashFiles, contrast, folderColor, newState, readableOn, render, view, type State } from "../extensions/filetree.ts";
 const theme: any = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => `[${t}]`, style: (t: string) => `{${t}}`, bold: (t: string) => t };
 const s: State = {
   ...newState(),
@@ -99,4 +99,9 @@ const live: any = { get colors() { return current; } };
 assert.equal(folderColor(live), "mdLink");
 current = purpleHeading;
 assert.equal(folderColor(live), "mdHeading", "re-picked after a theme switch");
+// highlighted file names stay readable: theme text when it contrasts, else a fallback
+const lightTheme: any = { colors: palette({ text: "#24292f", selectedBg: "#f0f3f6" }) };
+const paleBg = parseColor("#c8dcf5"), darkBg = parseColor("#1a2433");
+assert.equal(readableOn(lightTheme, paleBg), lightTheme.colors.text, "theme text on a pale highlight");
+assert(contrast(readableOn(lightTheme, darkBg), darkBg) >= 4.5, "readable on a dark highlight too");
 console.log("---\n" + small.join("\n") + "\nOK");

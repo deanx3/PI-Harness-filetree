@@ -13,7 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { OverlayHandle, TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
-import { colorToRgb, isKeyRelease, matchesKey, mixColors, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Color, colorToRgb, isKeyRelease, matchesKey, mixColors, rgbColor, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const WIDTH = 40;
 const LINGER_MS = 1500; // keep a read/write highlighted this long after it finishes, so quick reads are visible
@@ -125,13 +125,43 @@ export function folderColor(theme: Theme): Fg {
 }
 
 /** Background for a row pi is reading (accent) or writing (warning): pulses while running, steady while lingering. */
-function activityBg(theme: Theme, kind: Kind, running: boolean, pulse: number): (text: string) => string {
+const luminance = (c: Color) => {
+	const lin = (v: number) => ((v /= 255) <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+	const { r, g, b } = colorToRgb(c);
+	return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+};
+/** WCAG contrast ratio, 1..21 */
+export const contrast = (a: Color, b: Color) => {
+	const [x, y] = [luminance(a), luminance(b)].sort((m, n) => n - m);
+	return (x + 0.05) / (y + 0.05);
+};
+/** Text color for a highlighted row: the theme's own text or background color when readable on it, else black or white. */
+export function readableOn(theme: Theme, bg: Color): Color {
+	const options = [theme.colors.text, theme.colors.selectedBg, rgbColor(0, 0, 0), rgbColor(255, 255, 255)];
+	return options.find((c) => contrast(c, bg) >= 4.5) ?? options.reduce((a, b) => (contrast(b, bg) > contrast(a, bg) ? b : a));
+}
+
+function onSelected(theme: Theme): ((t: string) => string) | undefined {
+	try {
+		const fg = readableOn(theme, theme.colors.selectedBg);
+		return (t) => theme.style(t, { fg });
+	} catch {
+		return undefined; // theme without concrete colors
+	}
+}
+
+/**
+ * Row pi is reading (accent) or writing (warning): a background that pulses while running and stays
+ * steady while lingering, and a file name color picked to stay readable on it.
+ */
+function activityStyle(theme: Theme, kind: Kind, running: boolean, pulse: number): { row: (t: string) => string; name: (t: string) => string } {
 	const amount = running ? [0.18, 0.3, 0.42, 0.3][pulse % 4] : 0.22;
 	try {
 		const bg = mixColors(theme.colors.selectedBg, theme.colors[kind === "write" ? "warning" : "accent"], amount, "srgb"); // srgb keeps the hue
-		return (t) => theme.style(t, { bg });
+		const fg = readableOn(theme, bg);
+		return { row: (t) => theme.style(t, { bg }), name: (t) => theme.style(t, { fg, bold: true }) };
 	} catch {
-		return (t) => theme.bg("selectedBg", t); // theme without concrete colors
+		return { row: (t) => theme.bg("selectedBg", t), name: (t) => theme.bold(t) }; // theme without concrete colors
 	}
 }
 
@@ -164,9 +194,9 @@ export function view(s: State, theme: Theme, width: number, maxRows: number): Vi
 	};
 	// color undefined = the terminal's own text color, like pi's chat text: readable even when a light
 	// theme runs on a dark terminal (or the reverse), where the theme's "text" color would vanish
-	const line = (left: string, name: string, color: Fg | undefined, right: string, bold: boolean) => {
+	const line = (left: string, name: string, color: Fg | ((t: string) => string) | undefined, right: string, bold: boolean) => {
 		const n = truncateToWidth(name, Math.max(4, cw - visibleWidth(left) - visibleWidth(right) - 1));
-		const colored = color ? theme.fg(color, n) : n;
+		const colored = typeof color === "function" ? color(n) : color ? theme.fg(color, n) : n;
 		const styled = bold ? theme.bold(colored) : colored;
 		return left + styled + " ".repeat(Math.max(1, cw - visibleWidth(left) - visibleWidth(n) - visibleWidth(right))) + right;
 	};
@@ -213,9 +243,12 @@ export function view(s: State, theme: Theme, width: number, maxRows: number): Vi
 			const color: Fg | undefined = code === "??" || code === "A" ? "success" : code === "D" ? "error" : code ? "warning" : undefined;
 			const right = code ? theme.fg("dim", s.delta.get(rel) ?? (code === "??" ? "new" : code)) : "";
 			if (lit) focus = rows.length;
-			text = line(lead + mark, name, lit ? undefined : color, right, !!lit);
+			const hl = lit && activityStyle(theme, lit, !!act, s.pulse);
+			// selected row: a plain name in the terminal's text color can vanish on the theme's selectedBg
+			const selName = !hl && !color && rel === s.sel ? onSelected(theme) : undefined;
+			text = line(lead + mark, name, hl ? hl.name : (selName ?? color), right, false);
 			rows.push({ path: rel, dir: false, open: false });
-			body.push(lit ? activityBg(theme, lit, !!act, s.pulse)(fit(text)) : rel === s.sel ? theme.bg("selectedBg", fit(text)) : fit(text));
+			body.push(hl ? hl.row(fit(text)) : rel === s.sel ? theme.bg("selectedBg", fit(text)) : fit(text));
 		});
 	};
 	walk(root, "", "");
