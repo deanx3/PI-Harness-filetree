@@ -160,9 +160,12 @@ export function view(s: State, theme: Theme, width: number, maxRows: number): Vi
 		const t = truncateToWidth(text, cw);
 		return t + " ".repeat(Math.max(0, cw - visibleWidth(t)));
 	};
-	const line = (left: string, name: string, color: Fg, right: string, bold: boolean) => {
+	// color undefined = the terminal's own text color, like pi's chat text: readable even when a light
+	// theme runs on a dark terminal (or the reverse), where the theme's "text" color would vanish
+	const line = (left: string, name: string, color: Fg | undefined, right: string, bold: boolean) => {
 		const n = truncateToWidth(name, Math.max(4, cw - visibleWidth(left) - visibleWidth(right) - 1));
-		const styled = bold ? theme.bold(theme.fg(color, n)) : theme.fg(color, n);
+		const colored = color ? theme.fg(color, n) : n;
+		const styled = bold ? theme.bold(colored) : colored;
 		return left + styled + " ".repeat(Math.max(1, cw - visibleWidth(left) - visibleWidth(n) - visibleWidth(right))) + right;
 	};
 	const rule = theme.fg("border", "─".repeat(cw));
@@ -205,10 +208,10 @@ export function view(s: State, theme: Theme, width: number, maxRows: number): Vi
 			const act = s.active.get(rel), done = s.touched.get(rel), code = s.git.get(rel);
 			const lit = act ?? s.recent.get(rel)?.kind;
 			const mark = act ? theme.fg(act === "write" ? "warning" : "accent", "● ") : done ? theme.fg(done === "write" ? "warning" : "accent", "• ") : "  ";
-			const color = code === "??" || code === "A" ? "success" : code === "D" ? "error" : code ? "warning" : "text";
+			const color: Fg | undefined = code === "??" || code === "A" ? "success" : code === "D" ? "error" : code ? "warning" : undefined;
 			const right = code ? theme.fg("dim", s.delta.get(rel) ?? (code === "??" ? "new" : code)) : "";
 			if (lit) focus = rows.length;
-			text = line(lead + mark, name, lit ? "text" : color, right, !!lit);
+			text = line(lead + mark, name, lit ? undefined : color, right, !!lit);
 			rows.push({ path: rel, dir: false, open: false });
 			body.push(lit ? activityBg(theme, lit, !!act, s.pulse)(fit(text)) : rel === s.sel ? theme.bg("selectedBg", fit(text)) : fit(text));
 		});
