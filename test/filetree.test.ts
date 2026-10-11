@@ -67,7 +67,8 @@ const b = (cmd: string) => Object.fromEntries(bashFiles(cmd, "/p", known));
 assert.deepEqual(b("cat README.md src/a.ts | head -5"), { "README.md": "read", "src/a.ts": "read" });
 assert.deepEqual(b("cd src && sed -n '1,40p' deep/b.ts 2>/dev/null"), { "src/deep/b.ts": "read" });
 assert.deepEqual(b("sed -i 's/x/y/' /p/src/a.ts"), { "src/a.ts": "write" });
-assert.deepEqual(b('echo hi > notes.txt; grep -i foo README.md'), { "notes.txt": "write", "README.md": "read" });
+assert.deepEqual(b('echo hi > README.md; grep -i foo src/a.ts'), { "README.md": "write", "src/a.ts": "read" });
+assert.deepEqual(b(`ls -la src 2>&1 | head -40; awk '{ if ($1 > 5) print }' README.md; node -e "x.role > assistant" > out.txt`), { "README.md": "read" }, "no junk from 2>&1, code, or files that don't exist");
 assert.deepEqual(b("ls -la && git status && cat ../other/README.md"), {});
 assert.deepEqual(b("Set-Location src; Get-Content deep/b.ts; Set-Content a.ts 'x'"), { "src/deep/b.ts": "read", "src/a.ts": "write" });
 // folders open with their files from disk: outside git, and for folders git shows empty (nested repos)

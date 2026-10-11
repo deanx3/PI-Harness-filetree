@@ -77,7 +77,9 @@ export function bashFiles(cmd: string, cwd: string, known: Set<string>, exists?:
 			const r = path.relative(cwd, path.resolve(dir, norm(w))).split(path.sep).join("/");
 			const redirect = words[i - 1] === ">";
 			const inside = r && !r.startsWith("..") && !path.isAbsolute(r);
-			if (!known.has(r) && !(inside && (redirect || exists?.(r)))) return;
+			// only real files: a word after ">" is often not one (2>&1, `x > 5}` inside awk/node code).
+			// Files a command creates show up after the turn's refresh instead.
+			if (!known.has(r) && !(inside && exists?.(r))) return;
 			if (out.get(r) !== "write") out.set(r, writes || redirect ? "write" : "read");
 		});
 	}
