@@ -7,6 +7,7 @@ A file tree on the right side of [pi](https://pi.dev), like Claude Code's filetr
 - Live activity: `●` on the file pi is reading (accent) or editing (orange) right now, `·` on files it touched this session
 - Folders open automatically along changed or touched files; everything else stays collapsed
 - Keeps the active file in view when the tree is taller than the terminal
+- Header: project and branch. Footer: what pi is doing now (`● editing src/a.ts`) and change totals
 
 ## Install
 
@@ -20,7 +21,7 @@ Restart pi. The tree shows on terminals at least 120 columns wide. `/filetree` h
 
 - Files touched by `bash` commands aren't highlighted (only `read`, `grep`, `find`, `ls`, `edit`, `write`); git status still picks up their changes after each turn.
 - The tree is an overlay: it sits on top of the right edge of the chat. Hide it with `/filetree` when you need the full width.
-- If you also use `pi-sidebar`, both draw on the right; keep one.
+- Don't combine with `pi-sidebar`: both draw on the right edge.
 
 ## Test
 

@@ -10,7 +10,7 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import type { OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-const WIDTH = 36;
+const WIDTH = 40;
 const MIN_COLS = 120;
 const READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const WRITE_TOOLS = new Set(["edit", "write"]);
@@ -22,7 +22,8 @@ export type State = {
 	files: string[]; // cwd-relative, "/"-separated
 	git: Map<string, string>; // path -> porcelain code ("M", "??", "D", ...)
 	delta: Map<string, string>; // path -> "+3 -1"
-	branch: string;
+	project: string;
+	branch: string; // "" outside git
 	touched: Map<string, Kind>; // this session
 	active: Map<string, Kind>; // running right now, by toolCallId
 	activeIds: Map<string, string>; // toolCallId -> path
@@ -54,6 +55,13 @@ export function render(s: State, theme: Theme, width: number, maxRows: number): 
 		for (let i = 1; i < parts.length; i++) open.add(parts.slice(0, i).join("/"));
 	}
 
+	const cw = width - 2; // inside the "│ " left edge
+	const fit = (text: string) => {
+		const t = truncateToWidth(text, cw);
+		return t + " ".repeat(Math.max(0, cw - visibleWidth(t)));
+	};
+	const rule = theme.fg("borderMuted", "─".repeat(cw));
+
 	const lines: string[] = [];
 	let focus = -1;
 	const walk = (dir: Dir, prefix: string, depth: number) => {
@@ -63,40 +71,59 @@ export function render(s: State, theme: Theme, width: number, maxRows: number): 
 			const indent = "  ".repeat(depth);
 			if (child) {
 				const isOpen = open.has(rel);
-				lines.push(theme.fg(isOpen ? "text" : "muted", `${indent}${isOpen ? "▾" : "▸"} ${name}/`));
+				lines.push(fit(`${indent}${theme.fg("dim", isOpen ? "▾" : "▸")} ${theme.fg(isOpen ? "text" : "muted", `${name}/`)}`));
 				if (isOpen) walk(child, rel, depth + 1);
 				continue;
 			}
 			const act = s.active.get(rel), done = s.touched.get(rel), code = s.git.get(rel);
-			const mark = act ? theme.fg(act === "write" ? "warning" : "accent", "●") : done ? theme.fg(done === "write" ? "warning" : "accent", "·") : " ";
+			const mark = act ? theme.fg(act === "write" ? "warning" : "accent", "●") : done ? theme.fg(done === "write" ? "warning" : "accent", "•") : " ";
 			const color = code === "??" || code === "A" ? "success" : code === "D" ? "error" : code ? "warning" : "text";
-			const right = code ? ` ${s.delta.get(rel) ?? (code === "??" ? "new" : code)}` : "";
+			const right = code ? (s.delta.get(rel) ?? (code === "??" ? "new" : code)) : "";
 			const left = `${indent}${mark} `;
-			const name_ = truncateToWidth(name, Math.max(4, width - visibleWidth(left) - right.length - 1));
+			const name_ = truncateToWidth(name, Math.max(4, cw - visibleWidth(left) - right.length - 1));
 			let text = theme.fg(color, name_);
 			if (act) {
 				text = theme.bold(text);
 				focus = lines.length;
 			}
-			const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(name_) - right.length));
-			lines.push(left + text + pad + theme.fg("dim", right.trim()));
+			const pad = " ".repeat(Math.max(1, cw - visibleWidth(left) - visibleWidth(name_) - right.length));
+			lines.push(fit(left + text + pad + theme.fg("dim", right)));
 		}
 	};
 	walk(root, "", 0);
 
-	const header = [theme.fg("borderAccent", truncateToWidth(` ${s.branch || "files"}`, width)), ""];
-	const room = Math.max(1, maxRows - header.length);
-	if (lines.length <= room) return [...header, ...lines];
-	// too tall: keep the active file in view
-	const start = Math.min(Math.max(0, focus - Math.floor(room / 2)), lines.length - room);
-	const view = lines.slice(start, start + room);
-	if (start > 0) view[0] = theme.fg("dim", `  … ${start} more`);
-	if (start + room < lines.length) view[view.length - 1] = theme.fg("dim", `  … ${lines.length - start - room + 1} more`);
-	return [...header, ...view];
+	const header = [
+		fit(theme.bold(theme.fg("accent", s.project)) + (s.branch ? theme.fg("muted", `  ⎇ ${s.branch}`) : "")),
+		rule,
+	];
+	const [cur] = s.active;
+	let plus = 0, minus = 0;
+	for (const d of s.delta.values()) {
+		const m = /^\+(\d+) -(\d+)$/.exec(d);
+		if (m) (plus += +m[1]), (minus += +m[2]);
+	}
+	const footer = [
+		rule,
+		fit(cur ? theme.fg(cur[1] === "write" ? "warning" : "accent", `● ${cur[1] === "write" ? "editing" : "reading"} `) + cur[0] : theme.fg("dim", "  idle")),
+		fit(s.branch ? theme.fg("muted", `${s.git.size} changed  `) + theme.fg("success", `+${plus}`) + " " + theme.fg("error", `-${minus}`) : theme.fg("dim", "not a git repo")),
+	];
+
+	const room = Math.max(1, maxRows - header.length - footer.length);
+	let body = lines;
+	if (lines.length > room) {
+		// too tall: keep the active file in view
+		const start = Math.min(Math.max(0, focus - Math.floor(room / 2)), lines.length - room);
+		body = lines.slice(start, start + room);
+		if (start > 0) body[0] = fit(theme.fg("dim", `  ↑ ${start} more`));
+		if (start + room < lines.length) body[body.length - 1] = fit(theme.fg("dim", `  ↓ ${lines.length - start - room + 1} more`));
+	}
+	while (body.length < room) body.push(fit("")); // solid column, so chat text can't show through
+	const edge = theme.fg("borderMuted", "│") + " ";
+	return [...header, ...body, ...footer].map((l) => edge + l);
 }
 
 export default function (pi: ExtensionAPI) {
-	const s: State = { files: [], git: new Map(), delta: new Map(), branch: "", touched: new Map(), active: new Map(), activeIds: new Map() };
+	const s: State = { files: [], git: new Map(), delta: new Map(), project: "", branch: "", touched: new Map(), active: new Map(), activeIds: new Map() };
 	let ctx: ExtensionContext | undefined;
 	let tui: TUI | undefined;
 	let handle: OverlayHandle | undefined;
@@ -110,12 +137,14 @@ export default function (pi: ExtensionAPI) {
 
 	async function refresh() {
 		if (!ctx) return;
+		s.project = path.basename(ctx.cwd);
 		const list = await git(["ls-files", "-co", "--exclude-standard", "-z"]);
 		if (list === undefined) {
 			// not a git repo: top level only, touched files fill in the rest
 			s.files = readdirSync(ctx.cwd, { withFileTypes: true }).filter((e) => !e.name.startsWith(".")).map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
 			s.git.clear();
-			s.branch = path.basename(ctx.cwd);
+			s.delta.clear();
+			s.branch = "";
 			return redraw();
 		}
 		s.files = list.split("\0").filter(Boolean);
