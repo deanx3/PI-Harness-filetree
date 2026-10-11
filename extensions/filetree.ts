@@ -13,9 +13,11 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { OverlayHandle, TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
-import { colorToRgb, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { colorToRgb, isKeyRelease, matchesKey, mixColors, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const WIDTH = 40;
+const LINGER_MS = 1500; // keep a read/write highlighted this long after it finishes, so quick reads are visible
+const PULSE_MS = 250; // highlight animation step
 const MIN_COLS = 120;
 const READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const WRITE_TOOLS = new Set(["edit", "write"]);
@@ -32,6 +34,8 @@ export type State = {
 	branch: string; // "" outside git
 	touched: Map<string, Kind>; // this session
 	active: Map<string, Kind>; // running right now
+	recent: Map<string, { kind: Kind; until: number }>; // just finished, still highlighted
+	pulse: number; // animation step for highlighted rows
 	activeIds: Map<string, string[]>; // toolCallId -> paths
 	open: Map<string, boolean>; // folders the user opened (true) or closed (false); wins over auto-open
 	sel?: string; // selected row
@@ -44,7 +48,7 @@ export type State = {
 
 export const newState = (): State => ({
 	files: [], git: new Map(), delta: new Map(), project: "", branch: "",
-	touched: new Map(), active: new Map(), activeIds: new Map(),
+	touched: new Map(), active: new Map(), activeIds: new Map(), recent: new Map(), pulse: 0,
 	open: new Map(), scroll: 0, follow: true, focused: false, loaded: new Set(),
 });
 
@@ -86,10 +90,18 @@ export type Slot = Row | "up" | "down" | undefined;
 export type View = { lines: string[]; slots: Slot[]; rows: Row[]; room: number };
 
 type Fg = Parameters<Theme["fg"]>[0];
-const folderColors = new WeakMap<Theme, Fg>();
+// keyed by the color table, not the Theme: pi hands extensions a live proxy that switches with /themes
+const folderColors = new WeakMap<object, Fg>();
 /** The theme color that stands out most from file text, git status colors and the background, so folders never look like modified/new files or fade out. */
 export function folderColor(theme: Theme): Fg {
-	let best = folderColors.get(theme);
+	let key: object;
+	try {
+		key = theme.colors;
+	} catch {
+		return "mdLink";
+	}
+	if (!key || typeof key !== "object") return "mdLink"; // theme without concrete colors
+	let best = folderColors.get(key);
 	if (best) return best;
 	best = "mdLink";
 	try {
@@ -106,8 +118,19 @@ export function folderColor(theme: Theme): Fg {
 	} catch {
 		// theme without concrete colors: keep the default
 	}
-	folderColors.set(theme, best);
+	folderColors.set(key, best);
 	return best;
+}
+
+/** Background for a row pi is reading (accent) or writing (warning): pulses while running, steady while lingering. */
+function activityBg(theme: Theme, kind: Kind, running: boolean, pulse: number): (text: string) => string {
+	const amount = running ? [0.18, 0.3, 0.42, 0.3][pulse % 4] : 0.22;
+	try {
+		const bg = mixColors(theme.colors.selectedBg, theme.colors[kind === "write" ? "warning" : "accent"], amount, "srgb"); // srgb keeps the hue
+		return (t) => theme.style(t, { bg });
+	} catch {
+		return (t) => theme.bg("selectedBg", t); // theme without concrete colors
+	}
 }
 
 const parents = (p: string) => p.split("/").slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join("/"));
@@ -180,13 +203,14 @@ export function view(s: State, theme: Theme, width: number, maxRows: number): Vi
 				return;
 			}
 			const act = s.active.get(rel), done = s.touched.get(rel), code = s.git.get(rel);
+			const lit = act ?? s.recent.get(rel)?.kind;
 			const mark = act ? theme.fg(act === "write" ? "warning" : "accent", "● ") : done ? theme.fg(done === "write" ? "warning" : "accent", "• ") : "  ";
 			const color = code === "??" || code === "A" ? "success" : code === "D" ? "error" : code ? "warning" : "text";
 			const right = code ? theme.fg("dim", s.delta.get(rel) ?? (code === "??" ? "new" : code)) : "";
-			if (act) focus = rows.length;
-			text = line(lead + mark, name, color, right, !!act);
+			if (lit) focus = rows.length;
+			text = line(lead + mark, name, lit ? "text" : color, right, !!lit);
 			rows.push({ path: rel, dir: false, open: false });
-			body.push(rel === s.sel ? theme.bg("selectedBg", fit(text)) : fit(text));
+			body.push(lit ? activityBg(theme, lit, !!act, s.pulse)(fit(text)) : rel === s.sel ? theme.bg("selectedBg", fit(text)) : fit(text));
 		});
 	};
 	walk(root, "", "");
@@ -203,10 +227,11 @@ export function view(s: State, theme: Theme, width: number, maxRows: number): Vi
 		fit(cur ? theme.fg(cur[1] === "write" ? "warning" : "accent", `● ${cur[1] === "write" ? "editing" : "reading"} `) + cur[0] : theme.fg("dim", "  idle")),
 		fit(s.branch ? theme.fg("muted", `${s.git.size} changed  `) + theme.fg("success", `+${plus}`) + " " + theme.fg("error", `-${minus}`) : theme.fg("dim", "not a git repo")),
 	];
-	if (s.focused) footer.push(fit(theme.fg("dim", "↑↓ move  ←→ fold  enter @file  esc")));
+	if (s.focused) footer.push(fit(theme.fg("dim", "↑↓ ←→ enter @file  esc or type: prompt")));
 
 	const room = Math.max(1, maxRows - header.length - footer.length);
-	if (s.follow && focus >= 0) s.scroll = focus - Math.floor(room / 2);
+	// follow: scroll only when the active file is out of view, so the tree doesn't jump on every read
+	if (s.follow && focus >= 0 && (focus <= s.scroll || focus >= s.scroll + room - 1)) s.scroll = focus - Math.floor(room / 2);
 	s.scroll = Math.min(Math.max(0, s.scroll), Math.max(0, rows.length - room));
 	const start = s.scroll;
 	const lines = body.slice(start, start + room);
@@ -277,6 +302,19 @@ export default function (pi: ExtensionAPI) {
 	let hidden = false;
 	let last: View | undefined; // latest render, for mapping clicks and keys to rows
 	const redraw = () => tui?.requestRender();
+	// animate highlighted rows; the timer runs only while something is highlighted
+	let timer: ReturnType<typeof setInterval> | undefined;
+	const animate = () => {
+		if (timer) return;
+		timer = setInterval(() => {
+			const now = Date.now();
+			for (const [p, r] of s.recent) if (r.until <= now) s.recent.delete(p);
+			s.pulse++;
+			if (!s.active.size && !s.recent.size) clearInterval(timer), (timer = undefined);
+			redraw();
+		}, PULSE_MS);
+		timer.unref?.();
+	};
 
 	async function git(args: string[]) {
 		const r = await pi.exec("git", args, { cwd: ctx!.cwd, timeout: 3000 });
@@ -348,6 +386,17 @@ export default function (pi: ExtensionAPI) {
 		void c.ui.custom<void>(
 			(t: TUI, theme: Theme, _kb, done) => {
 				tui = t;
+				// Any key the tree doesn't use (typing, backspace, ...) hands focus back to the prompt and
+				// lands there. Listeners run before pi routes the key, so after unfocus() it reaches the editor.
+				const navKeys = ["escape", "up", "down", "left", "right", "enter", "pageUp", "pageDown"] as const;
+				const stopListening = t.addInputListener((data) => {
+					// key releases (kitty protocol), e.g. letting go of alt+e, are not typing
+					if (handle?.isFocused() && !isKeyRelease(data) && !navKeys.some((k) => matchesKey(data, k))) {
+						handle.unfocus();
+						redraw();
+					}
+					return undefined;
+				});
 				return {
 					render: (w: number) => {
 						s.focused = !!handle?.isFocused();
@@ -357,8 +406,7 @@ export default function (pi: ExtensionAPI) {
 					handleInput(data: string) {
 						if (!last) return;
 						if (matchesKey(data, "escape")) return void (handle?.unfocus(), redraw());
-						const keys = ["up", "down", "left", "right", "enter", "pageUp", "pageDown"] as const;
-						const k = keys.find((key) => matchesKey(data, key));
+						const k = navKeys.find((key) => key !== "escape" && matchesKey(data, key));
 						if (!k) return;
 						mention(act(s, last, k));
 						redraw();
@@ -379,10 +427,13 @@ export default function (pi: ExtensionAPI) {
 							if (hit.dir) act(s, last, "toggle");
 							else if ((e.clickCount ?? 1) >= 2) mention(hit.path);
 						}
-						return { focus: true };
+						// handled, but no keyboard focus: clicking the prompt afterwards can't take it back, so
+						// typing must stay in the prompt; keyboard navigation is alt+e / `/filetree focus`
+						return { handled: true };
 					},
 					invalidate() {},
 					dispose() {
+						stopListening();
 						tui = undefined;
 						done();
 					},
@@ -412,6 +463,7 @@ export default function (pi: ExtensionAPI) {
 		await refresh();
 	});
 	pi.on("session_shutdown", async () => {
+		if (timer) clearInterval(timer), (timer = undefined);
 		handle?.hide();
 		handle = undefined;
 	});
@@ -431,9 +483,11 @@ export default function (pi: ExtensionAPI) {
 		if (!hits.size) return;
 		for (const [p, kind] of hits) {
 			s.active.set(p, kind);
+			s.recent.delete(p);
 			for (const d of parents(p)) if (s.open.get(d) === false) s.open.delete(d); // reveal it even in a folder the user closed
 		}
 		s.activeIds.set(e.toolCallId, [...hits.keys()]);
+		animate();
 		redraw();
 	});
 	pi.on("tool_execution_end", async (e) => {
@@ -445,6 +499,7 @@ export default function (pi: ExtensionAPI) {
 			const kind = s.active.get(p);
 			if (!kind) continue;
 			s.active.delete(p);
+			s.recent.set(p, { kind, until: Date.now() + LINGER_MS });
 			if (s.touched.get(p) !== "write") s.touched.set(p, kind);
 			wrote ||= kind === "write";
 		}

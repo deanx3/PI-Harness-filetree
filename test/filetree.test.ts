@@ -1,6 +1,7 @@
 import assert from "node:assert";
-import { act, bashFiles, newState, render, view, type State } from "../extensions/filetree.ts";
-const theme: any = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => `[${t}]`, bold: (t: string) => t };
+import { parseColor } from "@earendil-works/pi-tui";
+import { act, bashFiles, folderColor, newState, render, view, type State } from "../extensions/filetree.ts";
+const theme: any = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => `[${t}]`, style: (t: string) => `{${t}}`, bold: (t: string) => t };
 const s: State = {
   ...newState(),
   files: ["README.md", "src/a.ts", "src/deep/b.ts", "docs/x.md"],
@@ -13,11 +14,12 @@ const W = 40;
 const out = render(s, theme, W, 20);
 console.log(out.join("\n"));
 assert.equal(out.length, 20, "fills the full height");
-assert(out.every((l) => l.length === W && l.startsWith("│ ")), "every row is exactly the panel width with a left edge");
+const plainW = (l: string) => l.replace(/[[\]{}]/g, "").length; // the mock theme marks backgrounds with brackets
+assert(out.every((l) => plainW(l) === W && l.startsWith("│ ")), "every row is exactly the panel width with a left edge");
 assert(out[0].includes("demo") && out[0].includes("· main"), "header: project + branch");
 assert(out.some((l) => l.includes("▸ docs/")), "untouched folder stays closed");
 assert(out.some((l) => l.includes("▾ src/")) && out.some((l) => l.includes("▾ deep/")), "folders open along touched paths");
-assert(out.some((l) => /● a\.ts\s+\+3 -1$/.test(l)), "active file + delta");
+assert(out.some((l) => /● a\.ts\s+\+3 -1\]?$/.test(l)), "active file + delta");
 assert(!out.some((l) => l.includes("x.md")), "closed folder hides files");
 assert(out.at(-2)!.includes("● editing src/a.ts"), "footer: current activity");
 assert(out.at(-1)!.includes("2 changed  +3 -1"), "footer: totals");
@@ -46,6 +48,11 @@ act(f, v, "left");
 assert.equal(f.sel, "src", "left goes to the parent");
 const y = v.slots.findIndex((r) => r !== undefined && typeof r === "object" && r.path === "README.md");
 assert(v.lines[y].includes("README.md"), "click slot lines up with its row");
+assert(out.some((l) => l.includes("[│ ● a.ts") || l.includes("[├ ● a.ts") || l.includes("[└ ● a.ts")), "active file row has a background");
+// a finished read stays highlighted for a moment, then goes back to normal
+const r: State = { ...newState(), files: ["a.md", "b.md"], recent: new Map([["a.md", { kind: "read", until: Date.now() + 1000 }]]) };
+let rv = view(r, theme, W, 10).lines;
+assert(rv.some((l) => l.includes("[• ") || l.includes("[  a.md")) && !rv.some((l) => l.includes("[  b.md")), "recent read highlighted, others not");
 // overflow keeps active file visible
 s.files = Array.from({ length: 200 }, (_, i) => `src/f${String(i).padStart(3, "0")}.ts`).concat("src/a.ts");
 const small = render(s, theme, W, 14);
@@ -81,4 +88,14 @@ const gv = view(gitNested, theme, W, 20);
 assert(gv.lines.some((l) => l.includes("lib.js")) && !gv.lines.some((l) => l.includes("SHOULD-NOT-READ")), "in git, only folders git shows empty are read from disk");
 // shell reads outside the known list count when the file exists on disk
 assert.deepEqual(Object.fromEntries(bashFiles("cat pi-team/README.md ../x.md", "/p", new Set(), (r) => r === "pi-team/README.md" || r === "../x.md")), { "pi-team/README.md": "read" });
+// folder color follows a /themes switch: pi gives extensions one live theme object
+const palette = (hex: Record<string, string>) => Object.fromEntries(Object.entries(hex).map(([k, v]) => [k, parseColor(v)]));
+const base = { text: "#222222", warning: "#aa7700", success: "#228833", error: "#cc2222", selectedBg: "#eeeeee", userMessageBg: "#f4f4f4", borderAccent: "#888888", accent: "#888888", syntaxKeyword: "#888888" };
+const blueLink = palette({ ...base, mdLink: "#1144dd", mdHeading: "#aa7700" }); // heading clashes with warning
+const purpleHeading = palette({ ...base, mdLink: "#228833", mdHeading: "#8833cc" }); // link clashes with success
+let current = blueLink;
+const live: any = { get colors() { return current; } };
+assert.equal(folderColor(live), "mdLink");
+current = purpleHeading;
+assert.equal(folderColor(live), "mdHeading", "re-picked after a theme switch");
 console.log("---\n" + small.join("\n") + "\nOK");
