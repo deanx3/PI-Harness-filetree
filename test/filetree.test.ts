@@ -63,4 +63,22 @@ assert.deepEqual(b("sed -i 's/x/y/' /p/src/a.ts"), { "src/a.ts": "write" });
 assert.deepEqual(b('echo hi > notes.txt; grep -i foo README.md'), { "notes.txt": "write", "README.md": "read" });
 assert.deepEqual(b("ls -la && git status && cat ../other/README.md"), {});
 assert.deepEqual(b("Set-Location src; Get-Content deep/b.ts; Set-Content a.ts 'x'"), { "src/deep/b.ts": "read", "src/a.ts": "write" });
+// folders open with their files from disk: outside git, and for folders git shows empty (nested repos)
+const disk: Record<string, string[]> = { "pi-team": ["README.md", "extensions/"], "pi-team/extensions": ["kakashi.ts"] };
+const ng: State = { ...newState(), files: ["pi-team/", "notes.md"], list: (d) => disk[d] ?? [] };
+assert(!view(ng, theme, W, 20).lines.some((l) => l.includes("README.md")), "closed folder is not read");
+ng.sel = "pi-team";
+act(ng, view(ng, theme, W, 20), "enter");
+let nv = view(ng, theme, W, 20);
+assert(nv.lines.some((l) => l.includes("README.md")) && nv.lines.some((l) => l.includes("▸ extensions/")), "non-git folder shows its files");
+ng.sel = "pi-team/extensions";
+act(ng, nv, "enter");
+nv = view(ng, theme, W, 20);
+assert(nv.lines.some((l) => l.includes("kakashi.ts")), "nested folder loads too");
+assert.equal(ng.files.filter((f) => f === "pi-team/README.md").length, 1, "read once, no duplicates");
+const gitNested: State = { ...newState(), branch: "main", files: ["src/a.ts", "vendor/"], open: new Map([["vendor", true], ["src", true]]), list: (d) => (d === "vendor" ? ["lib.js"] : ["SHOULD-NOT-READ"]) };
+const gv = view(gitNested, theme, W, 20);
+assert(gv.lines.some((l) => l.includes("lib.js")) && !gv.lines.some((l) => l.includes("SHOULD-NOT-READ")), "in git, only folders git shows empty are read from disk");
+// shell reads outside the known list count when the file exists on disk
+assert.deepEqual(Object.fromEntries(bashFiles("cat pi-team/README.md ../x.md", "/p", new Set(), (r) => r === "pi-team/README.md" || r === "../x.md")), { "pi-team/README.md": "read" });
 console.log("---\n" + small.join("\n") + "\nOK");

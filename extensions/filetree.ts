@@ -8,12 +8,12 @@
  * so it looks the same in Windows Terminal, macOS Terminal, kitty, and the rest.
  * Mouse needs pi's fullscreen mode (the default); the keyboard works in both modes.
  */
-import { readdirSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { OverlayHandle, TUI, TuiMouseEvent } from "@earendil-works/pi-tui";
-import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { colorToRgb, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const WIDTH = 40;
 const MIN_COLS = 120;
@@ -38,12 +38,14 @@ export type State = {
 	scroll: number; // first visible tree row
 	follow: boolean; // keep the active file in view; off once the user scrolls or moves
 	focused: boolean;
+	loaded: Set<string>; // folders already read from disk
+	list?: (dir: string) => string[]; // read a folder from disk: names, folders end in "/"
 };
 
 export const newState = (): State => ({
 	files: [], git: new Map(), delta: new Map(), project: "", branch: "",
 	touched: new Map(), active: new Map(), activeIds: new Map(),
-	open: new Map(), scroll: 0, follow: true, focused: false,
+	open: new Map(), scroll: 0, follow: true, focused: false, loaded: new Set(),
 });
 
 /**
@@ -51,7 +53,7 @@ export const newState = (): State => ({
  * Write = after `>`/`>>`, or in a segment with sed/perl -i, tee, mv, cp, rm, touch, truncate,
  * or a PowerShell writer (Set-Content, Out-File, Remove-Item, ...).
  */
-export function bashFiles(cmd: string, cwd: string, known: Set<string>): Map<string, Kind> {
+export function bashFiles(cmd: string, cwd: string, known: Set<string>, exists?: (rel: string) => boolean): Map<string, Kind> {
 	// ponytail: word matching, not a shell parser; globs and $vars are missed, and cp's source counts as a write
 	const out = new Map<string, Kind>();
 	const norm = (w: string) => {
@@ -70,7 +72,8 @@ export function bashFiles(cmd: string, cwd: string, known: Set<string>): Map<str
 		words.forEach((w, i) => {
 			const r = path.relative(cwd, path.resolve(dir, norm(w))).split(path.sep).join("/");
 			const redirect = words[i - 1] === ">";
-			if (!known.has(r) && !(redirect && r && !r.startsWith(".."))) return;
+			const inside = r && !r.startsWith("..") && !path.isAbsolute(r);
+			if (!known.has(r) && !(inside && (redirect || exists?.(r)))) return;
 			if (out.get(r) !== "write") out.set(r, writes || redirect ? "write" : "read");
 		});
 	}
@@ -81,6 +84,31 @@ export type Row = { path: string; dir: boolean; open: boolean };
 /** One entry per rendered line: a tree row, a "more" marker to scroll by, or nothing (header/footer). */
 export type Slot = Row | "up" | "down" | undefined;
 export type View = { lines: string[]; slots: Slot[]; rows: Row[]; room: number };
+
+type Fg = Parameters<Theme["fg"]>[0];
+const folderColors = new WeakMap<Theme, Fg>();
+/** The theme color that stands out most from file text, git status colors and the background, so folders never look like modified/new files or fade out. */
+export function folderColor(theme: Theme): Fg {
+	let best = folderColors.get(theme);
+	if (best) return best;
+	best = "mdLink";
+	try {
+		const rgb = (t: Fg) => colorToRgb(theme.colors[t]);
+		// status colors to stay apart from, plus the theme's near-background colors so folders keep contrast
+		const taken = (["text", "warning", "success", "error"] as const).map(rgb);
+		taken.push(...(["selectedBg", "userMessageBg"] as const).map((t) => colorToRgb(theme.colors[t])));
+		let bestGap = -1;
+		for (const t of ["mdLink", "mdHeading", "borderAccent", "accent", "syntaxKeyword"] as const) {
+			const c = rgb(t);
+			const gap = Math.min(...taken.map((o) => Math.hypot(c.r - o.r, c.g - o.g, c.b - o.b)));
+			if (gap > bestGap) (bestGap = gap), (best = t);
+		}
+	} catch {
+		// theme without concrete colors: keep the default
+	}
+	folderColors.set(theme, best);
+	return best;
+}
 
 const parents = (p: string) => p.split("/").slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join("/"));
 
@@ -109,12 +137,12 @@ export function view(s: State, theme: Theme, width: number, maxRows: number): Vi
 		const t = truncateToWidth(text, cw);
 		return t + " ".repeat(Math.max(0, cw - visibleWidth(t)));
 	};
-	const line = (left: string, name: string, color: Parameters<Theme["fg"]>[0], right: string, bold: boolean) => {
+	const line = (left: string, name: string, color: Fg, right: string, bold: boolean) => {
 		const n = truncateToWidth(name, Math.max(4, cw - visibleWidth(left) - visibleWidth(right) - 1));
 		const styled = bold ? theme.bold(theme.fg(color, n)) : theme.fg(color, n);
 		return left + styled + " ".repeat(Math.max(1, cw - visibleWidth(left) - visibleWidth(n) - visibleWidth(right))) + right;
 	};
-	const rule = theme.fg("borderMuted", "─".repeat(cw));
+	const rule = theme.fg("border", "─".repeat(cw));
 
 	const rows: Row[] = [];
 	const body: string[] = [];
@@ -124,10 +152,20 @@ export function view(s: State, theme: Theme, width: number, maxRows: number): Vi
 		entries.forEach(([name, child], i) => {
 			const rel = prefix ? `${prefix}/${name}` : name;
 			const last = i === entries.length - 1;
-			const lead = theme.fg("borderMuted", guide + (prefix ? (last ? "└ " : "├ ") : ""));
+			const lead = theme.fg("border", guide + (prefix ? (last ? "└ " : "├ ") : ""));
 			let text: string;
 			if (child) {
 				const isOpen = s.open.get(rel) ?? auto.has(rel);
+				// git lists every tracked file; read from disk only outside git, or for folders git
+				// shows empty (nested repos, untracked or ignored folders)
+				if (isOpen && s.list && !s.loaded.has(rel) && (!s.branch || child.size === 0)) {
+					s.loaded.add(rel);
+					for (const name of s.list(rel)) {
+						s.files.push(`${rel}/${name}`); // kept, so later renders still have it
+						const bare = name.replace(/\/$/, "");
+						if (!child.has(bare)) child.set(bare, name.endsWith("/") ? new Map() : null);
+					}
+				}
 				let right = "";
 				if (!isOpen) {
 					// changes hidden inside a closed folder: ?:1 M:2 D:1
@@ -135,7 +173,7 @@ export function view(s: State, theme: Theme, width: number, maxRows: number): Vi
 					for (const [p, code] of s.git) if (p.startsWith(`${rel}/`)) n[code === "??" || code === "A" ? "?" : code === "D" ? "D" : "M"]++;
 					right = [n["?"] && theme.fg("success", `?:${n["?"]}`), n.M && theme.fg("warning", `M:${n.M}`), n.D && theme.fg("error", `D:${n.D}`)].filter(Boolean).join(" ");
 				}
-				text = line(lead + theme.fg("muted", isOpen ? "▾ " : "▸ "), `${name}/`, isOpen ? "text" : "muted", right, false);
+				text = line(lead + theme.fg(folderColor(theme), isOpen ? "▾ " : "▸ "), `${name}/`, folderColor(theme), right, isOpen);
 				rows.push({ path: rel, dir: true, open: isOpen });
 				body.push(rel === s.sel ? theme.bg("selectedBg", fit(text)) : fit(text));
 				if (isOpen) walk(child, rel, guide + (prefix ? (last ? "  " : "│ ") : ""));
@@ -176,7 +214,7 @@ export function view(s: State, theme: Theme, width: number, maxRows: number): Vi
 	if (start > 0) (lines[0] = fit(theme.fg("dim", `  ↑ ${start + 1} more`))), (slots[0] = "up");
 	if (start + room < rows.length) (lines[lines.length - 1] = fit(theme.fg("dim", `  ↓ ${rows.length - start - room + 1} more`))), (slots[lines.length - 1] = "down");
 	while (lines.length < room) lines.push(fit("")), slots.push(undefined); // solid column, so chat text can't show through
-	const edge = theme.fg("borderMuted", "│") + " ";
+	const edge = theme.fg("border", "│") + " ";
 	return {
 		lines: [...header, ...lines, ...footer].map((l) => edge + l),
 		slots: [...header.map(() => undefined), ...slots, ...footer.map(() => undefined)],
@@ -219,6 +257,20 @@ export function act(s: State, v: View, action: "up" | "down" | "left" | "right" 
 
 export default function (pi: ExtensionAPI) {
 	const s = newState();
+	s.list = (dir) => {
+		try {
+			return readdirSync(path.join(ctx!.cwd, dir), { withFileTypes: true }).filter((e) => !e.name.startsWith(".")).map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+		} catch {
+			return []; // gone or unreadable
+		}
+	};
+	const isFile = (r: string) => {
+		try {
+			return statSync(path.join(ctx!.cwd, r)).isFile();
+		} catch {
+			return false;
+		}
+	};
 	let ctx: ExtensionContext | undefined;
 	let tui: TUI | undefined;
 	let handle: OverlayHandle | undefined;
@@ -234,10 +286,11 @@ export default function (pi: ExtensionAPI) {
 	async function refresh() {
 		if (!ctx) return;
 		s.project = path.basename(ctx.cwd);
+		s.loaded.clear(); // file list is rebuilt below; open folders re-read on the next render
 		const list = await git(["ls-files", "-co", "--exclude-standard", "-z"]);
 		if (list === undefined) {
 			// not a git repo: top level only, touched files fill in the rest
-			s.files = readdirSync(ctx.cwd, { withFileTypes: true }).filter((e) => !e.name.startsWith(".")).map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+			s.files = s.list!("");
 			s.git.clear();
 			s.delta.clear();
 			s.branch = "";
@@ -369,7 +422,7 @@ export default function (pi: ExtensionAPI) {
 		ctx = c;
 		let hits: Map<string, Kind>;
 		if (SHELL_TOOLS.has(e.toolName) && typeof e.args?.command === "string") {
-			hits = bashFiles(e.args.command, c.cwd, new Set(s.files));
+			hits = bashFiles(e.args.command, c.cwd, new Set(s.files), isFile);
 		} else {
 			const kind: Kind | undefined = WRITE_TOOLS.has(e.toolName) ? "write" : READ_TOOLS.has(e.toolName) ? "read" : undefined;
 			const p = kind && rel(e.args?.path ?? e.args?.file_path);
