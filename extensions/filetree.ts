@@ -421,8 +421,10 @@ export default function (pi: ExtensionAPI) {
 
 	function show(c: ExtensionContext) {
 		if (!c.hasUI || tui) return;
-		void c.ui.custom<void>(
+		c.ui.custom<void>(
 			(t: TUI, theme: Theme, _kb, done) => {
+				// web front-ends (pi-web-ui) hand over a TUI stand-in without input hooks: the panel is terminal-only
+				if (typeof t.addInputListener !== "function") throw new Error("filetree: no terminal UI");
 				tui = t;
 				// Any key the tree doesn't use (typing, backspace, ...) hands focus back to the prompt and
 				// lands there. Listeners run before pi routes the key, so after unfocus() it reaches the editor.
@@ -492,7 +494,7 @@ export default function (pi: ExtensionAPI) {
 					h.unfocus();
 				},
 			},
-		);
+		).catch(() => {}); // a panel failure must never take down the host (pi-lens rethrows unhandled rejections)
 	}
 
 	pi.on("session_start", async (_e, c) => {
